@@ -64,37 +64,28 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are DisputeIQ, an expert fraud operations analyst specializing in chargeback representment decisions for fintech merchants operating in emerging markets (LatAm, Africa, Southeast Asia).
+SYSTEM_PROMPT = """You are DisputeIQ, an expert fraud operations analyst for chargeback representment decisions.
 
-Your role: analyze chargeback claims systematically using available tools, then deliver a precise recommendation.
+WORKFLOW — call tools in this order, then output verdict:
+1. lookup_transaction -> 2. get_reason_code_details -> 3. get_merchant_dispute_history -> 4. output JSON
 
-Mandatory workflow:
-1. Call lookup_transaction with the transaction ID to retrieve all evidence
-2. Call get_reason_code_details with the reason code and network to understand requirements
-3. Call get_merchant_dispute_history with the merchant ID to assess historical context
-4. After all three tools have been called, produce your final JSON analysis
+OUTPUT RULES — non-negotiable:
+Your final message after all tool calls must be ONLY valid JSON. Nothing else.
+Start with { and end with }. No words, no markdown, no backticks before or after.
 
-Special attention: When reviewing MC 4863 cases, always check for friendly fraud indicators — late filing delay (20+ days post-delivery), product activation by cardholder, login activity post-delivery, device fingerprint match to known cardholder profile.
+JSON must include these exact keys:
+recommendation (string: "FIGHT" or "ACCEPT")
+confidence (number 0-1)
+reason_code_classification (object with code, network, name)
+evidence_strength (string: "STRONG", "MODERATE", or "WEAK")
+key_evidence_for_fight (array of strings)
+key_evidence_against (array of strings)
+estimated_win_probability (number 0-1)
+friendly_fraud_flag (boolean)
+representment_letter (string — full formal letter if FIGHT, empty string if ACCEPT)
+summary (string — 2-3 sentences)
 
-Final output: After all tool calls are complete, respond with ONLY a valid JSON object. No markdown, no backticks, no preamble, no explanation — raw JSON only.
-
-Required JSON schema:
-{
-  "recommendation": "FIGHT" or "ACCEPT",
-  "confidence": 0.0-1.0,
-  "reason_code_classification": {
-    "code": "10.4",
-    "network": "visa",
-    "name": "Other Fraud – Card Absent Environment"
-  },
-  "evidence_strength": "STRONG" or "MODERATE" or "WEAK",
-  "key_evidence_for_fight": ["point 1", "point 2", "point 3"],
-  "key_evidence_against": ["risk 1", "risk 2"],
-  "estimated_win_probability": 0.0-1.0,
-  "friendly_fraud_flag": true or false,
-  "representment_letter": "Full formal representment letter addressed to the card issuing bank. Must cite specific transaction evidence: auth codes, 3DS ECI codes, device fingerprint history, delivery confirmation, activation records. Reference the applicable Mastercard or Visa rule. Empty string if recommending ACCEPT.",
-  "summary": "2-3 sentence plain-English explanation of the decision rationale."
-}"""
+MC 4863 only: flag friendly_fraud_flag=true if late filing (20+ days post-delivery) + product activation with cardholder email + post-delivery login from same device."""
 
 
 def execute_tool(name: str, input_data: dict) -> dict:
@@ -187,15 +178,32 @@ async def run_agent_stream(case: dict) -> AsyncGenerator[str, None]:
             # If no tool calls, this is the final response
             if not tool_blocks:
                 raw = " ".join(b.text for b in text_blocks)
-                match = re.search(r"\{[\s\S]*\}", raw)
-                if match:
-                    try:
-                        verdict = json.loads(match.group())
-                        yield f"data: {json.dumps({'type': 'verdict', 'data': verdict})}\n\n"
-                    except json.JSONDecodeError as e:
-                        yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to parse verdict JSON: {e}'})}\n\n"
+                stripped = raw.replace("```json", "").replace("```", "").strip()
+
+                verdict = None
+                pos = 0
+                while pos < len(stripped):
+                    start = stripped.find("{", pos)
+                    if start == -1:
+                        break
+                    end = stripped.rfind("}")
+                    while end > start:
+                        try:
+                            candidate = stripped[start:end + 1]
+                            parsed = json.loads(candidate)
+                            if "recommendation" in parsed:
+                                verdict = parsed
+                                break
+                        except json.JSONDecodeError:
+                            end = stripped.rfind("}", 0, end)
+                    if verdict:
+                        break
+                    pos = start + 1
+
+                if verdict:
+                    yield f"data: {json.dumps({'type': 'verdict', 'data': verdict})}\n\n"
                 else:
-                    yield f"data: {json.dumps({'type': 'error', 'message': 'Agent did not return structured JSON', 'raw': raw[:300]})}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Could not extract valid JSON from agent response', 'raw': stripped[:300]})}\n\n"
                 break
 
             # Execute each tool call and stream the result
